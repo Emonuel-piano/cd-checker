@@ -4,7 +4,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 # --- [バージョン定義] ---
-VERSION = "V1.5.0"
+VERSION = "V1.5.1"
 
 # --- [定数・API URLの設定] ---
 I_DOM = "itunes." + "apple.com"
@@ -112,8 +112,8 @@ def _parse_rakuten_items(data):
     return cd_info_list
 
 
-def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key):
-    """アルバム名＋曲名単体の2クエリで検索し、結果をマージして返す（重複除去済み）"""
+def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key, track_name=""):
+    """アルバム名＋アーティスト名、曲名＋アーティスト名の2クエリで検索しマージして返す"""
     clean_album = album_keyword.split(" - ")[0].split(" (")[0]
     headers = {
         "Origin": "https://trycloudflare.com",
@@ -128,18 +128,20 @@ def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key):
         "sort": "standard"
     }
 
-    # クエリ1: アルバム名で検索
+    # クエリ1: アルバム名 + アーティスト名
     params_album = {**base_params, "title": clean_album}
     data_album = _rakuten_fetch_raw(params_album, headers)
     items_album = _parse_rakuten_items(data_album) if data_album else []
 
-    # クエリ2: 曲名（= album_keywordがアルバム名と異なる場合のみ）で追加検索
-    # ※ iTunes経由では album_name を渡しているが、曲名単体でも試みる
-    params_track = {**base_params, "title": artist_name}  # artistNameのみで広く拾う
-    data_track = _rakuten_fetch_raw(params_track, headers)
-    items_track = _parse_rakuten_items(data_track) if data_track else []
+    # クエリ2: 曲名 + アーティスト名（曲名が渡された場合のみ）
+    data_track = None
+    items_track = []
+    if track_name and track_name.lower() != clean_album.lower():
+        params_track = {**base_params, "title": track_name}
+        data_track = _rakuten_fetch_raw(params_track, headers)
+        items_track = _parse_rakuten_items(data_track) if data_track else []
 
-    # マージ（cd_number重複除去）
+    # マージ（cd_number重複除去、アルバム名検索結果を優先）
     seen = {cd["cd_number"] for cd in items_album}
     merged = list(items_album)
     for cd in items_track:
@@ -298,7 +300,8 @@ if st.button("検索を開始する", type="primary"):
                         # ── 楽天API検索（2クエリマージ） ──
                         rakuten_result = fetch_from_rakuten_2026(
                             album["album_name"], album["exact_artist"],
-                            input_app_id, input_access_key
+                            input_app_id, input_access_key,
+                            track_name=album["exact_track"]
                         )
 
                         st.markdown("━━━━ **流通物理CD対応型番** ━━━━")
@@ -356,7 +359,7 @@ if st.button("検索を開始する", type="primary"):
             else:
                 # iTunes全滅 → 楽天を直接検索
                 st.info("⚠️ デジタル配信データは見つかりませんでした。物理CDデータベースを直接検索します。")
-                rakuten_result = fetch_from_rakuten_2026(user_track, user_artist, input_app_id, input_access_key)
+                rakuten_result = fetch_from_rakuten_2026(user_track, user_artist, input_app_id, input_access_key, track_name=user_track)
 
                 if rakuten_result and rakuten_result.get("data"):
                     for idx, info in enumerate(rakuten_result["data"], 1):
