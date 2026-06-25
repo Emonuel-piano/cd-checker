@@ -1,9 +1,10 @@
 import streamlit as st
 import requests
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 # --- [バージョン定義] ---
-VERSION = "V1.4.0"
+VERSION = "V1.5.0"
 
 # --- [定数・API URLの設定] ---
 I_DOM = "itunes." + "apple.com"
@@ -72,50 +73,13 @@ def fetch_multi_from_itunes(track_name, artist_name, filter_mode, max_display):
         return None
 
 
-def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key):
-    """2026年最新仕様に準拠し、正確なキー(makerCode)と備考欄データを抽出する関数"""
-    clean_title = album_keyword.split(" - ")[0].split(" (")[0]
-
-    params = {
-        "applicationId": app_id,
-        "accessKey": access_key,
-        "title": clean_title,
-        "artistName": artist_name,
-        "format": "json",
-        "hits": 8,
-        "sort": "standard"
-    }
-    headers = {
-        "Origin": "https://trycloudflare.com",
-        "User-Agent": "Mozilla/5.0-CDChecker"
-    }
+def _rakuten_fetch_raw(params, headers):
+    """楽天APIへの実際のHTTPリクエスト（内部共通処理）"""
     try:
         res = requests.get(RAKUTEN_URL, params=params, headers=headers, timeout=10)
         if res.status_code != 200:
             return None
-
-        data = res.json()
-        items = data.get("Items", [])
-
-        cd_info_list = []
-        for item_wrapper in items:
-            item = item_wrapper.get("Item", {})
-            cd_num = item.get("makerCode") or item.get("salesCode") or "（型番なし）"
-
-            label = item.get("label", "不明")
-            jan = item.get("jan", "不明")
-            release_date = item.get("salesDate", "不明")
-            note_text = f"🏢 レーベル: {label} | 📦 JAN: {jan} | 📅 発売日: {release_date}"
-
-            cd_info_list.append({
-                "cd_number": cd_num,
-                "cd_title": item.get("title", "タイトル不明"),
-                "price": item.get("itemPrice", 0),
-                "url": item.get("itemUrl", "#"),
-                "note": note_text
-            })
-        return {"data": cd_info_list, "raw": data}
-
+        return res.json()
     except requests.exceptions.RequestException as e:
         st.error(f"楽天API 通信エラー: {e}")
         return None
@@ -124,13 +88,73 @@ def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key):
         return None
 
 
+def _parse_rakuten_items(data):
+    """楽天APIレスポンスからCD情報リストを生成（内部共通処理）"""
+    cd_info_list = []
+    seen_cd_numbers = set()
+    for item_wrapper in data.get("Items", []):
+        item = item_wrapper.get("Item", {})
+        cd_num = item.get("makerCode") or item.get("salesCode") or "（型番なし）"
+        if cd_num in seen_cd_numbers:
+            continue
+        seen_cd_numbers.add(cd_num)
+        label = item.get("label", "不明")
+        jan = item.get("jan", "不明")
+        release_date = item.get("salesDate", "不明")
+        note_text = f"🏢 レーベル: {label} | 📦 JAN: {jan} | 📅 発売日: {release_date}"
+        cd_info_list.append({
+            "cd_number": cd_num,
+            "cd_title": item.get("title", "タイトル不明"),
+            "price": item.get("itemPrice", 0),
+            "url": item.get("itemUrl", "#"),
+            "note": note_text
+        })
+    return cd_info_list
+
+
+def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key):
+    """アルバム名＋曲名単体の2クエリで検索し、結果をマージして返す（重複除去済み）"""
+    clean_album = album_keyword.split(" - ")[0].split(" (")[0]
+    headers = {
+        "Origin": "https://trycloudflare.com",
+        "User-Agent": "Mozilla/5.0-CDChecker"
+    }
+    base_params = {
+        "applicationId": app_id,
+        "accessKey": access_key,
+        "artistName": artist_name,
+        "format": "json",
+        "hits": 8,
+        "sort": "standard"
+    }
+
+    # クエリ1: アルバム名で検索
+    params_album = {**base_params, "title": clean_album}
+    data_album = _rakuten_fetch_raw(params_album, headers)
+    items_album = _parse_rakuten_items(data_album) if data_album else []
+
+    # クエリ2: 曲名（= album_keywordがアルバム名と異なる場合のみ）で追加検索
+    # ※ iTunes経由では album_name を渡しているが、曲名単体でも試みる
+    params_track = {**base_params, "title": artist_name}  # artistNameのみで広く拾う
+    data_track = _rakuten_fetch_raw(params_track, headers)
+    items_track = _parse_rakuten_items(data_track) if data_track else []
+
+    # マージ（cd_number重複除去）
+    seen = {cd["cd_number"] for cd in items_album}
+    merged = list(items_album)
+    for cd in items_track:
+        if cd["cd_number"] not in seen:
+            seen.add(cd["cd_number"])
+            merged.append(cd)
+
+    raw_combined = {"query_album": data_album, "query_track": data_track}
+    return {"data": merged, "raw": raw_combined} if merged else {"data": [], "raw": raw_combined}
+
+
 def fetch_from_ndl(keyword, artist_name):
     """楽天で全滅した際に、国立国会図書館(NDL)のアーカイブを簡易探索する関数"""
     clean_title = keyword.split(" - ")[0].split(" (")[0]
-
-    params = {
-        "any": f"{artist_name} {clean_title}"
-    }
+    params = {"any": f"{artist_name} {clean_title}"}
     try:
         res = requests.get(NDL_URL, params=params, timeout=5)
         if res.status_code != 200:
@@ -138,19 +162,14 @@ def fetch_from_ndl(keyword, artist_name):
 
         root = ET.fromstring(res.content)
         ndl_items = []
-
         for item in root.findall('.//item'):
             title_el = item.find('title')
             link_el = item.find('link')
             desc_el = item.find('description')
-            title = title_el.text if title_el is not None else "不明"
-            link = link_el.text if link_el is not None else "#"
-            desc = desc_el.text if desc_el is not None else "詳細情報なし"
-
             ndl_items.append({
-                "title": title,
-                "url": link,
-                "desc": desc
+                "title": title_el.text if title_el is not None else "不明",
+                "url": link_el.text if link_el is not None else "#",
+                "desc": desc_el.text if desc_el is not None else "詳細情報なし"
             })
         return {"data": ndl_items, "raw_xml": res.text}
 
@@ -163,54 +182,22 @@ def fetch_from_ndl(keyword, artist_name):
 
 
 def render_search_assist(track_name, artist_name):
-    """常に下部に表示する検索補助セクション"""
-    import urllib.parse
+    """入力欄直下に常時表示する検索補助セクション"""
     st.markdown("---")
     st.markdown("#### 🔍 さらに詳しく調べる")
-
     query_text = f"{artist_name} {track_name} CD 番号 型番"
     ai_question = f"{artist_name}の「{track_name}」について、収録アルバム名・何曲目に入っているか・CDの規格品番をできるだけ詳しく教えてください。"
-
     google_url = "https://www.google.com/search?q=" + urllib.parse.quote(query_text)
     perplexity_url = "https://www.perplexity.ai/search?q=" + urllib.parse.quote(ai_question)
 
     col_g, col_p = st.columns(2)
     with col_g:
-        st.link_button(
-            "🔎 Googleで検索する",
-            google_url,
-            use_container_width=True
-        )
+        st.link_button("🔎 Googleで検索する", google_url, use_container_width=True)
         st.caption(f"検索ワード: `{query_text}`")
     with col_p:
-        st.link_button(
-            "🤖 Perplexityに相談する（無料・アカウント不要）",
-            perplexity_url,
-            use_container_width=True
-        )
+        st.link_button("🤖 Perplexityに相談する（無料・アカウント不要）", perplexity_url, use_container_width=True)
         st.caption("アルバム・トラック番号・CD型番をAIに質問")
-
-
-def render_apple_music_only(album):
-    """楽天・NDL全滅時にApple Musicのデータのみを表示するヘルパー"""
-    st.caption("📱 Apple Music 配信情報のみ取得できました（型番・JAN情報なし）")
-    left_col, right_col = st.columns([1, 2])
-    with left_col:
-        if album["artwork_url"]:
-            st.image(album["artwork_url"], use_container_width=True)
-    with right_col:
-        st.markdown(f"**楽曲正式名**: {album['exact_track']}")
-        st.markdown(f"**アーティスト**: {album['exact_artist']}")
-        st.markdown(f"**アルバム名**: {album['album_name']}")
-        track_num = album.get("track_number")
-        track_count = album.get("track_count")
-        if track_num:
-            track_info = f"{track_num}曲目"
-            if track_count:
-                track_info += f" / 全{track_count}曲"
-            st.markdown(f"**収録位置**: {track_info}")
-        if album["preview_url"]:
-            st.audio(album["preview_url"], format="audio/m4a")
+    st.markdown("---")
 
 
 # --- [Streamlit 画面構成セクション] ---
@@ -253,7 +240,7 @@ col_track, col_track_clear = st.columns([5, 1])
 with col_track:
     user_track = st.text_input("🎵 曲名を入力", placeholder="例: Lemon", key="track_input")
 with col_track_clear:
-    st.write("")  # ラベル分の余白
+    st.write("")
     if st.button("🗑️", key="clear_track", help="曲名をクリア"):
         st.session_state["track_input"] = ""
         st.rerun()
@@ -262,10 +249,14 @@ col_artist, col_artist_clear = st.columns([5, 1])
 with col_artist:
     user_artist = st.text_input("👤 アーティスト名を入力", placeholder="例: 米津玄師", key="artist_input")
 with col_artist_clear:
-    st.write("")  # ラベル分の余白
+    st.write("")
     if st.button("🗑️", key="clear_artist", help="アーティスト名をクリア"):
         st.session_state["artist_input"] = ""
         st.rerun()
+
+# ── 検索補助セクション（入力欄直下・常時表示） ──
+if user_track and user_artist:
+    render_search_assist(user_track, user_artist)
 
 if st.button("検索を開始する", type="primary"):
     if not input_app_id or not input_access_key:
@@ -304,7 +295,7 @@ if st.button("検索を開始する", type="primary"):
                         if album["preview_url"]:
                             st.audio(album["preview_url"], format="audio/m4a")
 
-                        # ── 楽天API検索 ──
+                        # ── 楽天API検索（2クエリマージ） ──
                         rakuten_result = fetch_from_rakuten_2026(
                             album["album_name"], album["exact_artist"],
                             input_app_id, input_access_key
@@ -313,26 +304,19 @@ if st.button("検索を開始する", type="primary"):
                         st.markdown("━━━━ **流通物理CD対応型番** ━━━━")
 
                         if rakuten_result and rakuten_result.get("data"):
-                            # Apple Musicのアルバム名と重複するものは除外
                             apple_album_lower = album["album_name"].lower()
-                            new_cd_items = [
-                                cd for cd in rakuten_result["data"]
-                                if cd["cd_title"].lower() != apple_album_lower
-                            ]
                             all_cd_items = rakuten_result["data"]
 
-                            # まずApple Music由来の情報（アルバム名一致分）を表示
-                            matched_items = [
-                                cd for cd in all_cd_items
-                                if cd["cd_title"].lower() == apple_album_lower
-                            ]
+                            # アルバム名一致分を先に表示
+                            matched_items = [cd for cd in all_cd_items if cd["cd_title"].lower() == apple_album_lower]
                             for cd_info in matched_items:
                                 st.markdown(f"💿 **{cd_info['cd_title']}**")
                                 st.code(f"{cd_info['cd_number']}", language="text")
                                 st.caption(cd_info["note"])
                                 st.caption(f"流通価格: {cd_info['price']}円 | [楽天で詳細を見る]({cd_info['url']})")
 
-                            # 楽天にしかない追加データを表示（重複なし）
+                            # 楽天にしかない追加CDを表示
+                            new_cd_items = [cd for cd in all_cd_items if cd["cd_title"].lower() != apple_album_lower]
                             if new_cd_items:
                                 st.caption("📦 楽天APIで見つかった追加CD:")
                                 for cd_info in new_cd_items:
@@ -346,9 +330,8 @@ if st.button("検索を開始する", type="primary"):
                                 st.json(rakuten_result.get("raw", {}))
 
                         else:
-                            # 楽天ヒット0 → Apple Musicの持っているデータを表示してからNDLへ
+                            # 楽天ヒット0 → NDLへ（Apple Musicの二重表示はしない）
                             st.caption("🌐 対応する物理CD型番が楽天では見つかりませんでした。")
-                            render_apple_music_only(album)
 
                             if debug_mode and rakuten_result:
                                 st.markdown("🛠️ **楽天API 生レスポンスデータ**")
@@ -405,6 +388,3 @@ if st.button("検索を開始する", type="primary"):
                     if debug_mode and ndl_result:
                         st.markdown("🛠️ **国立国会図書館API 生リクエストXMLデータ**")
                         st.code(ndl_result.get("raw_xml", ""), language="xml")
-
-        # 常に表示する検索補助セクション
-        render_search_assist(user_track, user_artist)
