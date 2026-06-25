@@ -4,13 +4,19 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 # --- [バージョン定義] ---
-VERSION = "V1.6.0"
+VERSION = "V1.7.0"
 
 # --- [定数・API URLの設定] ---
 I_DOM = "itunes." + "apple.com"
 ITUNES_URL = "https://" + I_DOM + "/search"
 RAKUTEN_URL = "https://openapi.rakuten.co.jp/services/api/BooksCD/Search/20170404"
 NDL_URL = "https://ndlsearch.ndl.go.jp/api/opensearch"
+DDG_URL = "https://api.duckduckgo.com/"
+
+# --- [セッションステート初期化] ---
+for key, default in [("track_val", ""), ("artist_val", "")]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # --- [データ取得関数] ---
 def fetch_multi_from_itunes(track_name, artist_name, filter_mode, max_display):
@@ -133,7 +139,7 @@ def fetch_from_rakuten_2026(album_keyword, artist_name, app_id, access_key, trac
     data_album = _rakuten_fetch_raw(params_album, headers)
     items_album = _parse_rakuten_items(data_album) if data_album else []
 
-    # クエリ2: 曲名 + アーティスト名（曲名が渡された場合のみ）
+    # クエリ2: 曲名 + アーティスト名（曲名とアルバム名が異なる場合のみ）
     data_track = None
     items_track = []
     if track_name and track_name.lower() != clean_album.lower():
@@ -194,8 +200,6 @@ def _parse_ndl_items(root):
 def fetch_from_ndl(album_keyword, artist_name, track_name=""):
     """音楽CD絞り込み＋アルバム名・曲名の2クエリマージでNDLを探索する関数"""
     clean_album = album_keyword.split(" - ")[0].split(" (")[0]
-
-    # mediatype=6 で音楽CDに絞り込み
     base_params = {"mediatype": "6"}
 
     # クエリ1: アーティスト名 + アルバム名
@@ -204,11 +208,10 @@ def fetch_from_ndl(album_keyword, artist_name, track_name=""):
     items_album = _parse_ndl_items(root_album)
 
     # クエリ2: アーティスト名 + 曲名（曲名とアルバム名が異なる場合のみ）
-    root_track, xml_track = None, None
     items_track = []
     if track_name and track_name.lower() != clean_album.lower():
         params_track = {**base_params, "any": f"{artist_name} {track_name}"}
-        root_track, xml_track = _ndl_fetch_raw(params_track)
+        root_track, _ = _ndl_fetch_raw(params_track)
         items_track = _parse_ndl_items(root_track)
 
     # マージ（URL重複除去）
@@ -219,8 +222,50 @@ def fetch_from_ndl(album_keyword, artist_name, track_name=""):
             seen_urls.add(item["url"])
             merged.append(item)
 
-    raw_combined = {"query_album_xml": xml_album, "query_track_xml": xml_track}
     return {"data": merged, "raw_xml": xml_album or ""} if merged else {"data": [], "raw_xml": xml_album or ""}
+
+
+def fetch_ddg_cd_candidates(track_name, artist_name):
+    """DuckDuckGo非公式APIでCD番号候補を検索する（実験的機能）"""
+    query = f"{artist_name} {track_name} CD 規格品番"
+    params = {
+        "q": query,
+        "format": "json",
+        "no_redirect": "1",
+        "no_html": "1",
+        "skip_disambig": "1"
+    }
+    try:
+        res = requests.get(DDG_URL, params=params, timeout=8)
+        if res.status_code != 200:
+            return None
+        data = res.json()
+
+        candidates = []
+
+        # AbstractText（トップ要約）
+        if data.get("AbstractText"):
+            candidates.append({
+                "title": data.get("Heading", "概要"),
+                "snippet": data["AbstractText"],
+                "url": data.get("AbstractURL", "#")
+            })
+
+        # RelatedTopics（関連トピック）
+        for topic in data.get("RelatedTopics", [])[:5]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                candidates.append({
+                    "title": topic.get("Text", "")[:40] + "...",
+                    "snippet": topic.get("Text", ""),
+                    "url": topic.get("FirstURL", "#")
+                })
+
+        return candidates if candidates else None
+
+    except requests.exceptions.RequestException:
+        return None
+    except Exception:
+        return None
 
 
 def render_search_assist(track_name, artist_name):
@@ -242,17 +287,45 @@ def render_search_assist(track_name, artist_name):
     st.markdown("---")
 
 
+def render_rakuten_miss(album_name, artist_name, track_name, rakuten_result, debug_mode, input_app_id, input_access_key):
+    """楽天ヒット0のときの共通表示処理（DDG候補 → NDL）"""
+    st.caption("🌐 対応する物理CD型番が楽天では見つかりませんでした。")
+
+    # DuckDuckGo CD番号候補（実験的）
+    st.markdown("🦆 **DuckDuckGo検索によるCD番号の候補** _(実験的機能)_")
+    ddg_results = fetch_ddg_cd_candidates(track_name, artist_name)
+    if ddg_results:
+        for item in ddg_results:
+            st.info(f"**{item['title']}**\n\n{item['snippet']}")
+            if item["url"] != "#":
+                st.caption(f"[参照元を確認する]({item['url']})")
+    else:
+        st.caption("DuckDuckGoからも候補が見つかりませんでした。")
+
+    if debug_mode and rakuten_result:
+        st.markdown("🛠️ **楽天API 生レスポンスデータ**")
+        st.json(rakuten_result.get("raw", {}))
+
+    st.markdown("🏛️ **国立国会図書館の所蔵アーカイブを自動探索中...**")
+    ndl_result = fetch_from_ndl(album_name, artist_name, track_name=track_name)
+
+    if ndl_result and ndl_result["data"]:
+        for n_idx, n_item in enumerate(ndl_result["data"][:2], 1):
+            st.warning(f"国立国会図書館ヒット [{n_idx}]: {n_item['title']}")
+            st.caption(f"[国会図書館の該当ページで型番を確認する]({n_item['url']})")
+    else:
+        st.caption("❌ 国会図書館の公開検索システムにも該当する所蔵データがありませんでした。")
+
+    if debug_mode and ndl_result:
+        st.markdown("🛠️ **国立国会図書館API 生リクエストXMLデータ**")
+        st.code(ndl_result.get("raw_xml", ""), language="xml")
+
+
 # --- [Streamlit 画面構成セクション] ---
 st.set_page_config(page_title="楽曲のCD番号 チェッカー", page_icon="💿", layout="centered")
 
 st.title("💿 楽曲のCD番号 チェッカー")
 st.write("アーティスト名と曲名を入力すると、Appleのデータベース及び楽天APIからCD番号他主要データを表示します")
-
-# セッションステート初期化（クリアボタン用フラグ）
-if "do_clear_track" not in st.session_state:
-    st.session_state["do_clear_track"] = False
-if "do_clear_artist" not in st.session_state:
-    st.session_state["do_clear_artist"] = False
 
 input_app_id = st.secrets.get("RAKUTEN_APP_ID", "1944c4fa-f957-4985-a6d2-02d3ad38f477")
 input_access_key = st.secrets.get("RAKUTEN_ACCESS_KEY", "")
@@ -277,28 +350,28 @@ debug_mode = st.sidebar.checkbox("⚙️ 各APIの生データを表示（デバ
 st.sidebar.markdown("---")
 st.sidebar.caption(f"App Version: {VERSION}")
 
-# 入力欄 + クリアボタン（フラグ方式でStreamlit制約を回避）
+# ── 入力欄（keyなし・session_stateで直接管理）+ クリアボタン ──
 col_track, col_track_clear = st.columns([5, 1])
 with col_track:
-    track_default = "" if st.session_state["do_clear_track"] else st.session_state.get("track_input", "")
-    user_track = st.text_input("🎵 曲名を入力", value=track_default, placeholder="例: Lemon", key="track_input")
+    user_track = st.text_input("🎵 曲名を入力", value=st.session_state["track_val"], placeholder="例: Lemon")
 with col_track_clear:
     st.write("")
     if st.button("🗑️", key="clear_track", help="曲名をクリア"):
-        st.session_state["do_clear_track"] = True
+        st.session_state["track_val"] = ""
         st.rerun()
-st.session_state["do_clear_track"] = False
 
 col_artist, col_artist_clear = st.columns([5, 1])
 with col_artist:
-    artist_default = "" if st.session_state["do_clear_artist"] else st.session_state.get("artist_input", "")
-    user_artist = st.text_input("👤 アーティスト名を入力", value=artist_default, placeholder="例: 米津玄師", key="artist_input")
+    user_artist = st.text_input("👤 アーティスト名を入力", value=st.session_state["artist_val"], placeholder="例: 米津玄師")
 with col_artist_clear:
     st.write("")
     if st.button("🗑️", key="clear_artist", help="アーティスト名をクリア"):
-        st.session_state["do_clear_artist"] = True
+        st.session_state["artist_val"] = ""
         st.rerun()
-st.session_state["do_clear_artist"] = False
+
+# 入力値をsession_stateに保存（次のrerunで引き継ぐ）
+st.session_state["track_val"] = user_track
+st.session_state["artist_val"] = user_artist
 
 # ── 検索補助セクション（入力欄直下・常時表示） ──
 if user_track and user_artist:
@@ -354,7 +427,6 @@ if st.button("検索を開始する", type="primary"):
                             apple_album_lower = album["album_name"].lower()
                             all_cd_items = rakuten_result["data"]
 
-                            # アルバム名一致分を先に表示
                             matched_items = [cd for cd in all_cd_items if cd["cd_title"].lower() == apple_album_lower]
                             for cd_info in matched_items:
                                 st.markdown(f"💿 **{cd_info['cd_title']}**")
@@ -362,7 +434,6 @@ if st.button("検索を開始する", type="primary"):
                                 st.caption(cd_info["note"])
                                 st.caption(f"流通価格: {cd_info['price']}円 | [楽天で詳細を見る]({cd_info['url']})")
 
-                            # 楽天にしかない追加CDを表示
                             new_cd_items = [cd for cd in all_cd_items if cd["cd_title"].lower() != apple_album_lower]
                             if new_cd_items:
                                 st.caption("📦 楽天APIで見つかった追加CD:")
@@ -377,31 +448,14 @@ if st.button("検索を開始する", type="primary"):
                                 st.json(rakuten_result.get("raw", {}))
 
                         else:
-                            # 楽天ヒット0 → NDLへ（Apple Musicの二重表示はしない）
-                            st.caption("🌐 対応する物理CD型番が楽天では見つかりませんでした。")
-
-                            if debug_mode and rakuten_result:
-                                st.markdown("🛠️ **楽天API 生レスポンスデータ**")
-                                st.json(rakuten_result.get("raw", {}))
-
-                            st.markdown("🏛️ **国立国会図書館の所蔵アーカイブを自動探索中...**")
-                            ndl_result = fetch_from_ndl(album["album_name"], album["exact_artist"], track_name=album["exact_track"])
-
-                            if ndl_result and ndl_result["data"]:
-                                for n_idx, n_item in enumerate(ndl_result["data"][:2], 1):
-                                    st.warning(f"国立国会図書館ヒット [{n_idx}]: {n_item['title']}")
-                                    st.caption(f"[国会図書館の該当ページで型番を確認する]({n_item['url']})")
-                            else:
-                                st.caption("❌ 国会図書館の公開検索システムにも該当する所蔵データがありませんでした。")
-
-                            if debug_mode and ndl_result:
-                                st.markdown("🛠️ **国立国会図書館API 生リクエストXMLデータ**")
-                                st.code(ndl_result.get("raw_xml", ""), language="xml")
+                            render_rakuten_miss(
+                                album["album_name"], album["exact_artist"], album["exact_track"],
+                                rakuten_result, debug_mode, input_app_id, input_access_key
+                            )
 
                     st.markdown("---")
 
             else:
-                # iTunes全滅 → 楽天を直接検索
                 st.info("⚠️ デジタル配信データは見つかりませんでした。物理CDデータベースを直接検索します。")
                 rakuten_result = fetch_from_rakuten_2026(user_track, user_artist, input_app_id, input_access_key, track_name=user_track)
 
@@ -416,22 +470,7 @@ if st.button("検索を開始する", type="primary"):
                         st.json(rakuten_result.get("raw", {}))
 
                 else:
-                    st.caption("🌐 対応する物理CD型番が見つかりません。配信限定リリースか、CDが廃盤になっている可能性があります。")
-
-                    if debug_mode and rakuten_result:
-                        st.markdown("🛠️ **楽天API 生レスポンスデータ**")
-                        st.json(rakuten_result.get("raw", {}))
-
-                    st.markdown("🏛️ **国立国会図書館の所蔵アーカイブを自動探索中...**")
-                    ndl_result = fetch_from_ndl(user_track, user_artist, track_name=user_track)
-
-                    if ndl_result and ndl_result["data"]:
-                        for n_idx, n_item in enumerate(ndl_result["data"][:3], 1):
-                            st.warning(f"国立国会図書館ヒット [{n_idx}]: {n_item['title']}")
-                            st.caption(f"[国会図書館の該当ページで型番を確認する]({n_item['url']})")
-                    else:
-                        st.error("❌ 配信・物理CD・国会図書館のいずれからも該当楽曲を特定できませんでした。")
-
-                    if debug_mode and ndl_result:
-                        st.markdown("🛠️ **国立国会図書館API 生リクエストXMLデータ**")
-                        st.code(ndl_result.get("raw_xml", ""), language="xml")
+                    render_rakuten_miss(
+                        user_track, user_artist, user_track,
+                        rakuten_result, debug_mode, input_app_id, input_access_key
+                    )
