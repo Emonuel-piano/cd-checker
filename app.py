@@ -191,6 +191,7 @@ def render_search_assist(track_name, artist_name):
         st.caption("アルバム・トラック番号・CD型番をAIに質問")
 
 
+def render_apple_music_only(album):
     """楽天・NDL全滅時にApple Musicのデータのみを表示するヘルパー"""
     st.caption("📱 Apple Music 配信情報のみ取得できました（型番・JAN情報なし）")
     left_col, right_col = st.columns([1, 2])
